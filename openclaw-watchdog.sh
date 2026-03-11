@@ -15,8 +15,11 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuration (override via environment)
 # ---------------------------------------------------------------------------
-OPENCLAW_BIN="${OPENCLAW_BIN:-openclaw}"
+OPENCLAW_BIN="${OPENCLAW_BIN:-}"
 GATEWAY_PORT="${GATEWAY_PORT:-18789}"
+GATEWAY_LABEL="${OPENCLAW_GATEWAY_LABEL:-ai.openclaw.gateway}"
+LAUNCHD_DOMAIN="${OPENCLAW_LAUNCHD_DOMAIN:-gui/$UID}"
+GATEWAY_PLIST="${OPENCLAW_GATEWAY_PLIST:-$HOME/Library/LaunchAgents/${GATEWAY_LABEL}.plist}"
 LOG_DIR="${OPENCLAW_WATCHDOG_LOG_DIR:-$HOME/.openclaw/watchdog}"
 LOG_FILE="${LOG_DIR}/watchdog.log"
 MAX_LOG_BYTES="${MAX_LOG_BYTES:-$((10 * 1024 * 1024))}"  # 10 MB
@@ -24,7 +27,29 @@ MAX_RETRIES="${MAX_RETRIES:-3}"
 RETRY_DELAY="${RETRY_DELAY:-5}"
 STARTUP_WAIT="${STARTUP_WAIT:-20}"
 STARTUP_POLL="${STARTUP_POLL:-2}"
+CONTROL_TIMEOUT="${CONTROL_TIMEOUT:-15}"
 VERBOSE="${VERBOSE:-0}"
+
+resolve_openclaw_bin() {
+    local candidate
+    if [[ -n "$OPENCLAW_BIN" ]]; then
+        echo "$OPENCLAW_BIN"
+        return 0
+    fi
+
+    for candidate in \
+        "$(command -v openclaw 2>/dev/null || true)" \
+        /usr/local/bin/openclaw \
+        /opt/homebrew/bin/openclaw
+    do
+        if [[ -n "$candidate" && -x "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -80,9 +105,19 @@ check_http() {
     curl -sf -o /dev/null --connect-timeout 5 "http://127.0.0.1:${GATEWAY_PORT}/" 2>/dev/null
 }
 
-check_launchctl() {
+gateway_pid() {
     local pid
-    pid="$(launchctl list 2>/dev/null | awk '/ai\.openclaw\.gateway/ { print $1 }')"
+    pid="$(launchctl list 2>/dev/null | awk -v label="$GATEWAY_LABEL" '$3 == label { print $1 }')"
+    echo "$pid"
+}
+
+check_launchctl() {
+    launchctl print "${LAUNCHD_DOMAIN}/${GATEWAY_LABEL}" > /dev/null 2>&1
+}
+
+check_launchctl_running() {
+    local pid
+    pid="$(gateway_pid)"
     [[ -n "$pid" && "$pid" != "-" ]]
 }
 
@@ -91,13 +126,7 @@ is_healthy() {
     check_health_cmd || check_http
 }
 
-# ---------------------------------------------------------------------------
-# Restart gateway via openclaw CLI
-# ---------------------------------------------------------------------------
-restart_gateway() {
-    log INFO "Restarting gateway via: $OPENCLAW_BIN gateway restart"
-    "$OPENCLAW_BIN" gateway restart >> "$LOG_FILE" 2>&1 || true
-
+wait_for_health() {
     local elapsed=0
     while (( elapsed < STARTUP_WAIT )); do
         sleep "$STARTUP_POLL"
@@ -110,6 +139,76 @@ restart_gateway() {
 
     log ERROR "Gateway not healthy after ${STARTUP_WAIT}s"
     return 1
+}
+
+run_with_timeout() {
+    local timeout_secs="$1"
+    shift
+    env LC_ALL=C LANG=C /usr/bin/perl -e '
+        my $timeout = shift @ARGV;
+        my $pid = fork();
+        exit 125 unless defined $pid;
+        if ($pid == 0) {
+            exec @ARGV;
+            exit 127;
+        }
+        $SIG{ALRM} = sub {
+            kill 9, $pid;
+            waitpid($pid, 0);
+            exit 124;
+        };
+        alarm $timeout;
+        waitpid($pid, 0);
+        my $status = $?;
+        exit(($status & 127) ? (128 + ($status & 127)) : ($status >> 8));
+    ' "$timeout_secs" "$@"
+}
+
+run_control_cmd() {
+    local description="$1"
+    shift
+    local rc=0
+    run_with_timeout "$CONTROL_TIMEOUT" "$@" >> "$LOG_FILE" 2>&1 || rc=$?
+    if (( rc == 124 || rc == 142 )); then
+        log WARN "$description timed out after ${CONTROL_TIMEOUT}s"
+    fi
+    return "$rc"
+}
+
+reload_gateway_service() {
+    if [[ ! -f "$GATEWAY_PLIST" ]]; then
+        log WARN "Gateway LaunchAgent plist not found at $GATEWAY_PLIST"
+        return 1
+    fi
+
+    if ! check_launchctl; then
+        log WARN "Gateway LaunchAgent exists but is not loaded"
+        log INFO "Bootstrapping gateway service via: launchctl bootstrap ${LAUNCHD_DOMAIN} $GATEWAY_PLIST"
+        run_control_cmd "launchctl bootstrap" launchctl bootstrap "$LAUNCHD_DOMAIN" "$GATEWAY_PLIST" || true
+    fi
+
+    log INFO "Kickstarting gateway service via: launchctl kickstart -k ${LAUNCHD_DOMAIN}/${GATEWAY_LABEL}"
+    run_control_cmd "launchctl kickstart" launchctl kickstart -k "${LAUNCHD_DOMAIN}/${GATEWAY_LABEL}" || true
+
+    wait_for_health
+}
+
+# ---------------------------------------------------------------------------
+# Restart gateway via openclaw CLI
+# ---------------------------------------------------------------------------
+restart_gateway() {
+    log INFO "Restarting gateway via: $OPENCLAW_BIN gateway restart"
+    if run_control_cmd "openclaw gateway restart" "$OPENCLAW_BIN" gateway restart && wait_for_health; then
+        return 0
+    fi
+
+    log WARN "Gateway restart did not recover the service; trying gateway start"
+    if run_control_cmd "openclaw gateway start" "$OPENCLAW_BIN" gateway start && wait_for_health; then
+        return 0
+    fi
+
+    log WARN "Gateway start did not recover the service; trying launchctl bootstrap/kickstart"
+    reload_gateway_service
 }
 
 # ---------------------------------------------------------------------------
@@ -134,10 +233,12 @@ show_status() {
     fi
 
     printf "LaunchAgent (ai.openclaw.gateway): "
-    if check_launchctl; then
+    if check_launchctl_running; then
         local pid
-        pid="$(launchctl list 2>/dev/null | awk '/ai\.openclaw\.gateway/ { print $1 }')"
+        pid="$(gateway_pid)"
         echo "RUNNING (PID $pid)"
+    elif check_launchctl; then
+        echo "LOADED (no active PID)"
     else
         echo "NOT LOADED"
     fi
@@ -170,6 +271,17 @@ main() {
         esac
     done
 
+    if ! OPENCLAW_BIN="$(resolve_openclaw_bin)"; then
+        if (( status_only )); then
+            echo "OpenClaw CLI not found. Set OPENCLAW_BIN or add openclaw to PATH." >&2
+            exit 1
+        fi
+
+        mkdir -p "$LOG_DIR"
+        log ERROR "OpenClaw CLI not found. Set OPENCLAW_BIN or add openclaw to PATH."
+        exit 1
+    fi
+
     if (( status_only )); then
         show_status
         exit 0
@@ -177,6 +289,11 @@ main() {
 
     mkdir -p "$LOG_DIR"
     rotate_log
+
+    if ! [[ -x "$OPENCLAW_BIN" ]]; then
+        log ERROR "OpenClaw CLI not found. Set OPENCLAW_BIN or add openclaw to PATH."
+        exit 1
+    fi
 
     log INFO "Watchdog check started"
 

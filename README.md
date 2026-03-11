@@ -2,12 +2,12 @@
 
 A lightweight watchdog script that monitors your [OpenClaw](https://github.com/openclaw/openclaw) gateway and auto-restarts it when it goes down.
 
-**Why?** OpenClaw's gateway can occasionally crash due to memory pressure, API timeouts, or long idle periods. This watchdog ensures your AI agent stays online 24/7 without manual intervention.
+**Why?** OpenClaw's gateway can occasionally crash due to memory pressure, API timeouts, long idle periods, or a stale/unloaded launchd service. This watchdog ensures your AI agent stays online 24/7 without manual intervention.
 
 ## Features
 
 - 🏥 **Reliable health checks** — Uses `openclaw health` + HTTP probe (not `pgrep`/`lsof` which are [unreliable on macOS](#why-not-pgrep--lsof))
-- 🔄 **Auto-restart** with configurable retries and backoff
+- 🔄 **Auto-restart** using OpenClaw's own gateway/service commands
 - 📋 **Log rotation** — Keeps logs under 10 MB automatically
 - 🍎 **macOS LaunchAgent** included — Set-and-forget scheduling
 - 🐧 **Linux compatible** — Works with cron or systemd timers
@@ -44,12 +44,12 @@ curl -o ~/Library/LaunchAgents/com.openclaw.watchdog.plist \
   https://raw.githubusercontent.com/WZBbiao/openclaw-watchdog/main/com.openclaw.watchdog.plist
 
 # Load it (starts immediately + every 2 hours)
-launchctl load ~/Library/LaunchAgents/com.openclaw.watchdog.plist
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.openclaw.watchdog.plist
 ```
 
 To unload:
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.openclaw.watchdog.plist
+launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.openclaw.watchdog.plist
 ```
 
 </details>
@@ -127,7 +127,7 @@ All settings can be overridden via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENCLAW_BIN` | `openclaw` | Path to the OpenClaw binary |
+| `OPENCLAW_BIN` | auto-detected | Path to the OpenClaw binary |
 | `GATEWAY_PORT` | `18789` | Gateway HTTP port to probe |
 | `OPENCLAW_WATCHDOG_LOG_DIR` | `~/.openclaw/watchdog` | Log directory |
 | `MAX_LOG_BYTES` | `10485760` (10 MB) | Max log size before rotation |
@@ -135,6 +135,7 @@ All settings can be overridden via environment variables:
 | `RETRY_DELAY` | `5` | Seconds between retry attempts |
 | `STARTUP_WAIT` | `20` | Seconds to wait for gateway startup |
 | `STARTUP_POLL` | `2` | Polling interval during startup |
+| `CONTROL_TIMEOUT` | `15` | Seconds to allow each restart/start/bootstrap command before falling through |
 
 Example with custom config:
 
@@ -161,10 +162,28 @@ GATEWAY_PORT=19000 MAX_RETRIES=5 openclaw-watchdog.sh --verbose
 │      │                          │
 │      ▼ FAIL                     │
 │   3. Restart gateway            │
-│      └─► Retry up to 3x        │
+│      │                          │
+│      ├─► if needed:             │
+│      │    gateway start         │
+│      │    launchctl bootstrap   │
+│      │    launchctl kickstart   │
+│      └─► Retry up to 3x         │
 │          └─► Log result         │
 └─────────────────────────────────┘
 ```
+
+## Recovery behavior
+
+The watchdog only uses non-destructive recovery steps against your existing OpenClaw setup:
+
+```bash
+openclaw gateway restart
+openclaw gateway start
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/ai.openclaw.gateway.plist
+launchctl kickstart -k "gui/$(id -u)/ai.openclaw.gateway"
+```
+
+It does not run `openclaw gateway install --force`, and it does not rewrite your OpenClaw configuration or LaunchAgent plist.
 
 ## Why not pgrep / lsof?
 
@@ -175,6 +194,14 @@ Previous versions used `pgrep -f "openclaw-gateway"` and `lsof -iTCP:<port>` for
 - **lsof**: Non-root `lsof -iTCP:<port>` can miss processes due to macOS security restrictions (System Integrity Protection).
 
 The current approach uses `openclaw health` (which tests actual RPC connectivity) and `curl` (which tests the HTTP listener directly) — both are immune to these platform quirks.
+
+## Tests
+
+Run the lightweight shell tests locally:
+
+```bash
+bash openclaw-watchdog-test.sh
+```
 
 ## Logs
 
