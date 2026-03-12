@@ -9,7 +9,7 @@ A lightweight watchdog script that monitors your [OpenClaw](https://github.com/o
 - 🏥 **Reliable health checks** — Uses `openclaw health` + HTTP probe (not `pgrep`/`lsof` which are [unreliable on macOS](#why-not-pgrep--lsof))
 - 🔄 **Auto-restart** using OpenClaw's own gateway/service commands
 - 📋 **Log rotation** — Keeps logs under 10 MB automatically
-- 🍎 **macOS LaunchAgent** included — Set-and-forget scheduling
+- 🍎 **macOS LaunchAgent** included — runs as a persistent daemon
 - 🐧 **Linux compatible** — Works with cron or systemd timers
 - ⚙️ **Fully configurable** via environment variables
 
@@ -43,7 +43,7 @@ openclaw-watchdog.sh --verbose
 curl -o ~/Library/LaunchAgents/com.openclaw.watchdog.plist \
   https://raw.githubusercontent.com/WZBbiao/openclaw-watchdog/main/com.openclaw.watchdog.plist
 
-# Load it (starts immediately + every 2 hours)
+# Load it (starts the daemon immediately)
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.openclaw.watchdog.plist
 ```
 
@@ -103,6 +103,7 @@ sudo systemctl enable --now openclaw-watchdog.timer
 openclaw-watchdog.sh [OPTIONS]
 
 Options:
+  --daemon    Stay running and check every CHECK_INTERVAL seconds
   --status    Show current gateway health (no restart)
   --verbose   Print all log messages to stderr
   --help      Show help
@@ -136,6 +137,7 @@ All settings can be overridden via environment variables:
 | `STARTUP_WAIT` | `20` | Seconds to wait for gateway startup |
 | `STARTUP_POLL` | `2` | Polling interval during startup |
 | `CONTROL_TIMEOUT` | `15` | Seconds to allow each restart/start/bootstrap command before falling through |
+| `CHECK_INTERVAL` | `7200` | Seconds between checks in `--daemon` mode |
 
 Example with custom config:
 
@@ -148,14 +150,15 @@ GATEWAY_PORT=19000 MAX_RETRIES=5 openclaw-watchdog.sh --verbose
 ```
 ┌─────────────────────────────────┐
 │   launchd / cron / systemd      │
-│   (triggers every 2 hours)      │
+│   (keeps daemon running)        │
 └──────────────┬──────────────────┘
                │
                ▼
 ┌─────────────────────────────────┐
-│   openclaw-watchdog.sh          │
+│   openclaw-watchdog.sh --daemon │
 │                                 │
-│   1. openclaw health  ──► OK? ──┼──► Exit (healthy)
+│   loop forever                  │
+│   1. openclaw health  ──► OK? ──┼──► sleep 7200s
 │      │                          │
 │      ▼ FAIL                     │
 │   2. curl :18789/     ──► OK? ──┼──► Exit (healthy)
@@ -168,7 +171,7 @@ GATEWAY_PORT=19000 MAX_RETRIES=5 openclaw-watchdog.sh --verbose
 │      │    launchctl bootstrap   │
 │      │    launchctl kickstart   │
 │      └─► Retry up to 3x         │
-│          └─► Log result         │
+│          └─► sleep 7200s        │
 └─────────────────────────────────┘
 ```
 
@@ -184,6 +187,8 @@ launchctl kickstart -k "gui/$(id -u)/ai.openclaw.gateway"
 ```
 
 It does not run `openclaw gateway install --force`, and it does not rewrite your OpenClaw configuration or LaunchAgent plist.
+
+For macOS, the recommended setup is to run the watchdog as a long-lived LaunchAgent daemon with `--daemon`, rather than relying on `StartInterval` alone. This avoids missed interval runs after sleep/wake or stale launchd scheduling state.
 
 ## Why not pgrep / lsof?
 

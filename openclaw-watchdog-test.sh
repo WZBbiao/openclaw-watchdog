@@ -157,14 +157,40 @@ test_show_status_reports_loaded_without_pid() {
     teardown
 }
 
-main() {
+test_main_daemon_flag_enters_loop() {
+    echo "[test] main --daemon enters daemon loop"
+    setup
+    source_watchdog
+
+    local marker="$TEST_TMP/daemon.called"
+    write_mock_openclaw 'exit 0'
+    run_daemon_loop() {
+        : > "$marker"
+        return 0
+    }
+
+    if main --daemon >/dev/null 2>&1; then
+        if [[ -f "$marker" ]]; then
+            pass "main --daemon calls run_daemon_loop"
+        else
+            fail "main --daemon calls run_daemon_loop" "marker not written"
+        fi
+    else
+        fail "main --daemon calls run_daemon_loop" "main returned non-zero"
+    fi
+
+    teardown
+}
+
+run_all_tests() {
     test_restart_falls_back_to_start_and_launchctl_when_service_missing
     test_run_with_timeout_times_out
     test_reload_logs_missing_plist
     test_show_status_reports_loaded_without_pid
+    test_main_daemon_flag_enters_loop
 
     printf '\nTests run: %s, failed: %s\n' "$TESTS_RUN" "$TESTS_FAILED"
     [[ "$TESTS_FAILED" -eq 0 ]]
 }
 
-main "$@"
+run_all_tests "$@"

@@ -9,14 +9,14 @@
     <array>
         <!-- Update this path to where you installed the script -->
         <string>/usr/local/bin/openclaw-watchdog.sh</string>
+        <string>--daemon</string>
     </array>
 
-    <!-- Run every 2 hours (7200 seconds) -->
-    <key>StartInterval</key>
-    <integer>7200</integer>
-
-    <!-- Also run once at load (boot / login) -->
+    <!-- Start once at load and keep the daemon alive. -->
     <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
     <true/>
 
     <key>StandardOutPath</key>

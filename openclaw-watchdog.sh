@@ -2,7 +2,8 @@
 # openclaw-watchdog.sh - Monitor and auto-restart OpenClaw gateway
 #
 # Usage:
-#   ./openclaw-watchdog.sh              # Run a single health check (for cron/launchd)
+#   ./openclaw-watchdog.sh              # Run a single health check
+#   ./openclaw-watchdog.sh --daemon     # Stay running and check every 2 hours
 #   ./openclaw-watchdog.sh --status     # Show current status without restarting
 #   ./openclaw-watchdog.sh --verbose    # Run with console output
 #
@@ -28,6 +29,7 @@ RETRY_DELAY="${RETRY_DELAY:-5}"
 STARTUP_WAIT="${STARTUP_WAIT:-20}"
 STARTUP_POLL="${STARTUP_POLL:-2}"
 CONTROL_TIMEOUT="${CONTROL_TIMEOUT:-15}"
+CHECK_INTERVAL="${CHECK_INTERVAL:-7200}"
 VERBOSE="${VERBOSE:-0}"
 
 resolve_openclaw_bin() {
@@ -254,14 +256,58 @@ show_status() {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+run_check() {
+    mkdir -p "$LOG_DIR"
+    rotate_log
+
+    log INFO "Watchdog check started"
+
+    if is_healthy; then
+        log INFO "Gateway is healthy — nothing to do"
+        return 0
+    fi
+
+    log WARN "Gateway is DOWN — initiating restart sequence"
+
+    local attempt=1
+    while (( attempt <= MAX_RETRIES )); do
+        log INFO "Restart attempt $attempt/$MAX_RETRIES"
+        if restart_gateway; then
+            log INFO "Restart succeeded on attempt $attempt"
+            return 0
+        fi
+        log WARN "Restart attempt $attempt failed"
+        (( attempt++ ))
+        if (( attempt <= MAX_RETRIES )); then
+            log INFO "Waiting ${RETRY_DELAY}s before next attempt..."
+            sleep "$RETRY_DELAY"
+        fi
+    done
+
+    log ERROR "All $MAX_RETRIES restart attempts FAILED"
+    return 1
+}
+
+run_daemon_loop() {
+    trap 'log INFO "Watchdog daemon received termination signal"; exit 0' INT TERM
+    log INFO "Watchdog daemon started (interval: ${CHECK_INTERVAL}s)"
+
+    while true; do
+        run_check || true
+        sleep "$CHECK_INTERVAL"
+    done
+}
+
 main() {
+    local daemon_mode=0
     local status_only=0
     for arg in "$@"; do
         case "$arg" in
+            --daemon) daemon_mode=1 ;;
             --status)  status_only=1 ;;
             --verbose) VERBOSE=1 ;;
             --help|-h)
-                echo "Usage: $0 [--status] [--verbose] [--help]"
+                echo "Usage: $0 [--daemon] [--status] [--verbose] [--help]"
                 exit 0
                 ;;
             *)
@@ -287,40 +333,17 @@ main() {
         exit 0
     fi
 
-    mkdir -p "$LOG_DIR"
-    rotate_log
-
     if ! [[ -x "$OPENCLAW_BIN" ]]; then
         log ERROR "OpenClaw CLI not found. Set OPENCLAW_BIN or add openclaw to PATH."
         exit 1
     fi
 
-    log INFO "Watchdog check started"
-
-    if is_healthy; then
-        log INFO "Gateway is healthy — nothing to do"
-        exit 0
+    if (( daemon_mode )); then
+        run_daemon_loop
+        return 0
     fi
 
-    log WARN "Gateway is DOWN — initiating restart sequence"
-
-    local attempt=1
-    while (( attempt <= MAX_RETRIES )); do
-        log INFO "Restart attempt $attempt/$MAX_RETRIES"
-        if restart_gateway; then
-            log INFO "Restart succeeded on attempt $attempt"
-            exit 0
-        fi
-        log WARN "Restart attempt $attempt failed"
-        (( attempt++ ))
-        if (( attempt <= MAX_RETRIES )); then
-            log INFO "Waiting ${RETRY_DELAY}s before next attempt..."
-            sleep "$RETRY_DELAY"
-        fi
-    done
-
-    log ERROR "All $MAX_RETRIES restart attempts FAILED"
-    exit 1
+    run_check
 }
 
 if [[ "${OPENCLAW_WATCHDOG_TESTING:-}" != "1" ]]; then
